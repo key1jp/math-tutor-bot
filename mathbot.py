@@ -14,8 +14,8 @@ logging.basicConfig(
 logger = logging.getLogger('discord-bot')
 
 # 環境変数からキーとトークンを取得
-GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
-DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+GEMINI_API_KEY = getenv('GEMINI_API_KEY')
+DISCORD_BOT_TOKEN = getenv('DISCORD_BOT_TOKEN')
 
 # --- 👨‍🏫 キャラクター設定 (算数の先生) ---
 # 小学生の受験をサポートする、親しみやすい算数の先生として振る舞います。
@@ -39,9 +39,9 @@ model = genai.GenerativeModel('gemini-2.5-flash')
 image_model = genai.GenerativeModel('gemini-2.5-pro')
 
 # Discord Botの接続設定
-intents = discord.Intents.default()
+intents = Intents.default()
 intents.message_content = True
-client = discord.Client(intents=intents)
+client = Client(intents=intents)
 
 @client.event
 async def on_ready():
@@ -62,10 +62,12 @@ async def on_message(message):
         user_message = message.content.replace(f'<@!{client.user.id}>', '').strip()
         
         # スレッド内かどうかを判別
-        is_in_thread = isinstance(message.channel, discord.Thread)
+        is_in_thread = isinstance(message.channel, Thread)
         thread_info = f" (スレッド: {message.channel.name})" if is_in_thread else " (通常チャンネル)"
         
-        logger.info(f'受付{thread_info}: {user_message}, ユーザー: {message.author.display_name}')
+        sanitized_message = user_message.replace('\n', ' ').replace('\r', ' ')
+        sanitized_username = message.author.display_name.replace('\n', ' ').replace('\r', ' ')
+        logger.info(f'受付{thread_info}: {sanitized_message}, ユーザー: {sanitized_username}')
 
         # ✨ --- ここから画像処理のロジックを追加 ---
         response_text = ""
