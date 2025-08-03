@@ -1,0 +1,308 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Discord Bot on Fargate Spot'
+
+Parameters:
+  ImageUri:
+    Type: String
+    Description: ECR Image URI
+  GeminiApiKeyParameter:
+    Type: String
+    Default: /discord-bot/gemini-api-key
+    Description: SSM Parameter name for Gemini API Key
+  DiscordBotTokenParameter:
+    Type: String
+    Default: /discord-bot/discord-bot-token
+    Description: SSM Parameter name for Discord Bot Token
+  DiscordWebhookParameter:
+    Type: String
+    Default: /discord-bot/webhook-url
+    Description: SSM Parameter name for Discord Webhook URL
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  # Public Subnet
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Group
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Discord Bot Security Group
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders:
+        - FARGATE_SPOT
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: discord-bot
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: discord-bot
+          Image: !Ref ImageUri
+          Essential: true
+          Secrets:
+            - Name: GEMINI_API_KEY
+              ValueFrom: !Ref GeminiApiKeyParameter
+            - Name: DISCORD_BOT_TOKEN
+              ValueFrom: !Ref DiscordBotTokenParameter
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: discord-bot
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref SecurityGroup
+          Subnets:
+            - !Ref PublicSubnet
+          AssignPublicIp: ENABLED
+
+  # IAM Role for Task Execution
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GeminiApiKeyParameter}'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DiscordBotTokenParameter}'
+
+  # IAM Role for Task
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/discord-bot
+      RetentionInDays: 7
+
+  # SNS Topic for Alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: discord-bot-alerts
+
+  # Lambda Function for Discord Notification
+  DiscordNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: discord-bot-notification
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import urllib3
+          import boto3
+          import os
+          
+          def lambda_handler(event, context):
+              ssm = boto3.client('ssm')
+              webhook_url = ssm.get_parameter(
+                  Name=os.environ['WEBHOOK_PARAMETER'],
+                  WithDecryption=True
+              )['Parameter']['Value']
+              
+              message = json.loads(event['Records'][0]['Sns']['Message'])
+              alarm_name = message['AlarmName']
+              new_state = message['NewStateValue']
+              reason = message['NewStateReason']
+              
+              if 'TaskStopped' in alarm_name:
+                  color = 0xFF0000 if new_state == 'ALARM' else 0x00FF00
+                  title = 'Discord Bot Stopped' if new_state == 'ALARM' else 'Discord Bot Recovered'
+              else:
+                  color = 0xFFFF00
+                  title = f'Discord Bot Alert: {alarm_name}'
+              
+              payload = {
+                  'embeds': [{
+                      'title': title,
+                      'description': reason,
+                      'color': color,
+                      'timestamp': message['StateChangeTime']
+                  }]
+              }
+              
+              http = urllib3.PoolManager()
+              response = http.request(
+                  'POST',
+                  webhook_url,
+                  body=json.dumps(payload),
+                  headers={'Content-Type': 'application/json'}
+              )
+              
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          WEBHOOK_PARAMETER: !Ref DiscordWebhookParameter
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${DiscordWebhookParameter}'
+
+  # SNS Subscription
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref AlertTopic
+      Endpoint: !GetAtt DiscordNotificationFunction.Arn
+
+  # Lambda Permission for SNS
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DiscordNotificationFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  # CloudWatch Alarm for Task Stopped
+  TaskStoppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: ECSService
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-TaskStopped'
+      AlarmDescription: 'Discord Bot task has stopped'
+      MetricName: RunningTaskCount
+      Namespace: AWS/ECS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+Outputs:
+  ClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+  ServiceName:
+    Description: ECS Service Name
+    Value: !Ref ECSService
