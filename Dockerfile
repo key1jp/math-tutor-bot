@@ -6,5 +6,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY mathbot.py .
+COPY character_context.txt .
 
 CMD ["python", "-u", "mathbot.py"]
