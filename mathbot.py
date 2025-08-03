@@ -1,9 +1,9 @@
-import discord
+from discord import Client, Intents, Thread
 import google.generativeai as genai
-import os
+from os import getenv
 import io
 import logging
-from PIL import Image # 追加
+from PIL import Image
 
 # ログ設定
 logging.basicConfig(
